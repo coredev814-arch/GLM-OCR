@@ -1,0 +1,29 @@
+services:
+  glm-ocr:
+    build: .
+    image: glm-ocr-api:latest
+    container_name: glm-ocr
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8889}:8889"
+    env_file:
+      - .env
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys,json; r=urllib.request.urlopen('http://localhost:8889/health',timeout=2); sys.exit(0 if json.load(r).get('ready') else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+volumes:
+  hf_cache:
