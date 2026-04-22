@@ -12,6 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .config import settings
+from .layout import layout_engine
+from .pipeline import infer_document
 from .schemas import (
     ErrorResponse,
     HealthResponse,
@@ -40,25 +42,34 @@ async def lifespan(_: FastAPI):
                 raise
             logger.error("Model load failed; /health will report not-ready")
 
+        if settings.layout_enabled:
+            try:
+                await layout_engine.startup()
+                logger.info("Layout detector loaded: %s", settings.layout_model_dir)
+            except Exception:
+                logger.error("Layout detector load failed; task=auto will 503")
+
     if settings.background_model_load:
         load_task = asyncio.create_task(_load())
         try:
             yield
         finally:
             load_task.cancel()
+            await layout_engine.shutdown()
             await engine.shutdown()
     else:
         await _load()
         try:
             yield
         finally:
+            await layout_engine.shutdown()
             await engine.shutdown()
 
 
 app = FastAPI(
     title="GLM-OCR FastAPI (self-hosted)",
     description="Self-hosted FastAPI server around zai-org/GLM-OCR via transformers.",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -103,6 +114,8 @@ async def health() -> HealthResponse:
         dtype=engine.dtype,
         ready=engine.ready,
         load_error=engine.load_error,
+        layout_ready=layout_engine.ready,
+        layout_error=layout_engine.load_error,
     )
 
 
@@ -113,7 +126,7 @@ async def health() -> HealthResponse:
 )
 async def parse_uploads(
     files: List[UploadFile] = File(..., description="Image or PDF files."),
-    task: OcrTask = Form(OcrTask.text),
+    task: OcrTask = Form(OcrTask.auto),
     prompt: Optional[str] = Form(None),
     max_new_tokens: Optional[int] = Form(None),
     do_sample: Optional[bool] = Form(None),
@@ -121,7 +134,7 @@ async def parse_uploads(
     repetition_penalty: Optional[float] = Form(None),
     no_repeat_ngram_size: Optional[int] = Form(None),
 ) -> ParseResponse:
-    _require_ready()
+    _require_ready(task)
     if not files:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No files provided")
     if len(files) > settings.max_batch_size:
@@ -160,7 +173,9 @@ async def parse_uploads(
     responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
 )
 async def parse_urls(req: ParseByUrlRequest) -> ParseResponse:
-    _require_ready()
+    # URL inputs skip layout detection — force single-prompt mode.
+    task = req.task if req.task != OcrTask.auto else OcrTask.text
+    _require_ready(task)
     if len(req.images) > settings.max_batch_size:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -169,7 +184,7 @@ async def parse_urls(req: ParseByUrlRequest) -> ParseResponse:
     pages = [ImageInput(source=u, url=u) for u in req.images]
     return await _run(
         pages,
-        req.task,
+        task,
         req.prompt,
         req.max_new_tokens,
         req.do_sample,
@@ -179,11 +194,13 @@ async def parse_urls(req: ParseByUrlRequest) -> ParseResponse:
     )
 
 
-def _require_ready() -> None:
-    if engine.ready:
-        return
-    detail = engine.load_error or "model is still loading"
-    raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail)
+def _require_ready(task: OcrTask) -> None:
+    if not engine.ready:
+        detail = engine.load_error or "model is still loading"
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail)
+    if task == OcrTask.auto and not layout_engine.ready:
+        detail = layout_engine.load_error or "layout detector is still loading"
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail)
 
 
 async def _run(
@@ -196,16 +213,73 @@ async def _run(
     repetition_penalty: Optional[float] = None,
     no_repeat_ngram_size: Optional[int] = None,
 ) -> ParseResponse:
-    try:
-        resolved_prompt = resolve_prompt(task, prompt)
-    except ValueError as exc:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-
     mnt = max_new_tokens if max_new_tokens is not None else settings.max_new_tokens
     ds = do_sample if do_sample is not None else settings.do_sample
     temp = temperature if temperature is not None else settings.temperature
     rp = repetition_penalty if repetition_penalty is not None else settings.repetition_penalty
     nrng = no_repeat_ngram_size if no_repeat_ngram_size is not None else settings.no_repeat_ngram_size
+
+    if task == OcrTask.auto:
+        results = await _run_document_parse(pages, mnt, ds, temp, rp, nrng)
+    else:
+        results = await _run_single_prompt(pages, task, prompt, mnt, ds, temp, rp, nrng)
+
+    return ParseResponse(
+        id=f"glmocr-{uuid.uuid4().hex}",
+        model=settings.model_path,
+        device=engine.device,
+        pages=results,
+        text="\n\n---\n\n".join(r.text for r in results),
+    )
+
+
+async def _run_document_parse(
+    pages: List[ImageInput],
+    mnt: int,
+    ds: bool,
+    temp: float,
+    rp: float,
+    nrng: int,
+) -> List[PageResult]:
+    results: List[PageResult] = []
+    for page in pages:
+        try:
+            res = await infer_document(
+                page,
+                max_new_tokens=mnt,
+                do_sample=ds,
+                temperature=temp,
+                repetition_penalty=rp,
+                no_repeat_ngram_size=nrng,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Document-parse failed for %s", page.source)
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                f"Document-parse failed for {page.source}: {exc}",
+            ) from exc
+        results.append(res)
+    return results
+
+
+async def _run_single_prompt(
+    pages: List[ImageInput],
+    task: OcrTask,
+    prompt: Optional[str],
+    mnt: int,
+    ds: bool,
+    temp: float,
+    rp: float,
+    nrng: int,
+) -> List[PageResult]:
+    try:
+        resolved_prompt = resolve_prompt(task, prompt)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
     results: List[PageResult] = []
     for page in pages:
@@ -228,14 +302,7 @@ async def _run(
                 f"Inference failed for {page.source}: {exc}",
             ) from exc
         results.append(res)
-
-    return ParseResponse(
-        id=f"glmocr-{uuid.uuid4().hex}",
-        model=settings.model_path,
-        device=engine.device,
-        pages=results,
-        text="\n\n---\n\n".join(r.text for r in results),
-    )
+    return results
 
 
 @app.exception_handler(RuntimeError)

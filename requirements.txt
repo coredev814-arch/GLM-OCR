@@ -8,8 +8,14 @@ pydantic-settings>=2.2.0
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
 torch>=2.3.0
 torchvision>=0.18.0
-transformers>=4.46.0
+transformers>=5.3.0
 accelerate>=0.30.0
 safetensors>=0.4.0
 pillow>=10.0.0
 pdf2image>=1.17.0
+
+# Layout-aware document parsing (PP-DocLayoutV3 + ResultFormatter)
+glmocr>=0.1.5
+opencv-python-headless>=4.9.0
+# Column-split signal processing
+scipy>=1.11.0

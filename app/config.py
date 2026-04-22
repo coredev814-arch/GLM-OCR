@@ -44,5 +44,12 @@ class Settings(BaseSettings):
     background_model_load: bool = True
     fail_fast_on_load_error: bool = False
 
+    layout_enabled: bool = True
+    layout_model_dir: str = "PaddlePaddle/PP-DocLayoutV3_safetensors"
+    layout_device: Optional[str] = None
+    layout_threshold: float = 0.3
+
+    column_split_enabled: bool = True
+
 
 settings = Settings()

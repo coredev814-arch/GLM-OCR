@@ -4,14 +4,14 @@ import asyncio
 import io
 import logging
 import time
-import uuid
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Union
+from typing import List, Optional
 
 from PIL import Image
 
 from .config import settings
-from .schemas import TASK_PROMPTS, OcrTask, PageResult
+from .quality import QualityResult, score_page
+from .schemas import TASK_PROMPTS, OcrTask, PageResult, PageScore
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,15 @@ class ImageInput:
     source: str
     pil_image: Optional[Image.Image] = None
     url: Optional[str] = None
+
+
+@dataclass
+class RegionOutput:
+    """Raw per-region inference result, prior to stitching or scoring."""
+    raw_text: str
+    num_tokens: int
+    input_tokens: int
+    latency_ms: int
 
 
 class OcrEngine:
@@ -82,7 +91,6 @@ class OcrEngine:
         }[settings.torch_dtype]
 
     def _load(self) -> None:
-        import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
         logger.info("Loading processor from %s", settings.model_path)
@@ -109,6 +117,61 @@ class OcrEngine:
         self._dtype = str(first_param.dtype).replace("torch.", "")
         logger.info("Model ready on %s (%s)", self._device, self._dtype)
 
+    async def infer_region(
+        self,
+        pil_image: Image.Image,
+        *,
+        prompt: str,
+        max_new_tokens: int,
+        do_sample: bool,
+        temperature: float,
+        repetition_penalty: float,
+        no_repeat_ngram_size: int,
+    ) -> RegionOutput:
+        if not self._ready or self._model is None or self._processor is None:
+            raise RuntimeError("OCR engine is not ready")
+
+        async with self._infer_sem:
+            return await asyncio.to_thread(
+                self._infer_sync,
+                pil_image,
+                None,
+                prompt,
+                max_new_tokens,
+                do_sample,
+                temperature,
+                repetition_penalty,
+                no_repeat_ngram_size,
+            )
+
+    async def infer_url(
+        self,
+        url: str,
+        *,
+        prompt: str,
+        max_new_tokens: int,
+        do_sample: bool,
+        temperature: float,
+        repetition_penalty: float,
+        no_repeat_ngram_size: int,
+    ) -> RegionOutput:
+        """Inference path for URL inputs — skips layout detection."""
+        if not self._ready or self._model is None or self._processor is None:
+            raise RuntimeError("OCR engine is not ready")
+
+        async with self._infer_sem:
+            return await asyncio.to_thread(
+                self._infer_sync,
+                None,
+                url,
+                prompt,
+                max_new_tokens,
+                do_sample,
+                temperature,
+                repetition_penalty,
+                no_repeat_ngram_size,
+            )
+
     async def infer_page(
         self,
         page: ImageInput,
@@ -120,36 +183,64 @@ class OcrEngine:
         repetition_penalty: float,
         no_repeat_ngram_size: int,
     ) -> PageResult:
-        if not self._ready or self._model is None or self._processor is None:
-            raise RuntimeError("OCR engine is not ready")
-
-        async with self._infer_sem:
-            return await asyncio.to_thread(
-                self._infer_sync,
-                page,
-                prompt,
-                max_new_tokens,
-                do_sample,
-                temperature,
-                repetition_penalty,
-                no_repeat_ngram_size,
+        """Single-prompt page inference — used for task=text/table/formula/custom overrides."""
+        if page.pil_image is not None:
+            output = await self.infer_region(
+                page.pil_image,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
             )
+            width, height = page.pil_image.size
+        elif page.url is not None:
+            output = await self.infer_url(
+                page.url,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+            )
+            width = height = 0
+        else:
+            raise ValueError("ImageInput requires either pil_image or url")
+
+        quality = score_page(
+            raw_text=output.raw_text,
+            num_tokens=output.num_tokens,
+            max_tokens=max_new_tokens,
+            image_width=width,
+            image_height=height,
+        )
+        return build_page_result(
+            source=page.source,
+            prompt=prompt,
+            input_tokens=output.input_tokens,
+            num_tokens=output.num_tokens,
+            latency_ms=output.latency_ms,
+            quality=quality,
+        )
 
     def _infer_sync(
         self,
-        page: ImageInput,
+        pil_image: Optional[Image.Image],
+        url: Optional[str],
         prompt: str,
         max_new_tokens: int,
         do_sample: bool,
         temperature: float,
         repetition_penalty: float,
         no_repeat_ngram_size: int,
-    ) -> PageResult:
+    ) -> RegionOutput:
         import torch
 
         content = [
-            {"type": "image", "image": page.pil_image} if page.pil_image is not None
-            else {"type": "image", "url": page.url},
+            {"type": "image", "image": pil_image} if pil_image is not None
+            else {"type": "image", "url": url},
             {"type": "text", "text": prompt},
         ]
         messages = [{"role": "user", "content": content}]
@@ -180,21 +271,48 @@ class OcrEngine:
         latency_ms = int((time.perf_counter() - start) * 1000)
 
         new_tokens = generated_ids[0][input_len:]
-        text = self._processor.decode(
-            new_tokens, skip_special_tokens=settings.skip_special_tokens
-        )
+        num_tokens = int(new_tokens.shape[0])
+        raw_text = self._processor.decode(new_tokens, skip_special_tokens=False)
 
-        return PageResult(
-            source=page.source,
-            text=text,
-            prompt_used=prompt,
+        return RegionOutput(
+            raw_text=raw_text,
+            num_tokens=num_tokens,
             input_tokens=input_len,
-            output_tokens=int(new_tokens.shape[0]),
             latency_ms=latency_ms,
         )
 
 
 engine = OcrEngine()
+
+
+def build_page_result(
+    *,
+    source: str,
+    prompt: str,
+    input_tokens: int,
+    num_tokens: int,
+    latency_ms: int,
+    quality: QualityResult,
+    regions: Optional[list] = None,
+) -> PageResult:
+    return PageResult(
+        source=source,
+        text=quality.text,
+        raw_text=quality.raw_text,
+        prompt_used=prompt,
+        num_tokens=num_tokens,
+        input_tokens=input_tokens,
+        latency_ms=latency_ms,
+        score=PageScore(composite=quality.composite, variables=quality.variables),
+        flag=quality.flag,
+        flag_message=quality.flag_message,
+        flag_details=quality.flag_details,
+        attempts=1,
+        preset="fast",
+        ocr_engine="glm-ocr",
+        needs_external_ocr=quality.needs_external_ocr,
+        regions=regions,
+    )
 
 
 def resolve_prompt(task: OcrTask, custom: Optional[str]) -> str:
