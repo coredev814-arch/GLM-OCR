@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import List, Optional
@@ -14,6 +16,24 @@ from .quality import QualityResult, score_page
 from .schemas import TASK_PROMPTS, OcrTask, PageResult, PageScore
 
 logger = logging.getLogger(__name__)
+
+
+# Substrings that indicate the CUDA context is permanently broken for this
+# process. Match the user-visible error text since exception types vary across
+# torch versions ("CUDA error", torch._C._CudaError, plain RuntimeError, ...).
+_CUDA_FATAL_MARKERS = (
+    "CUDA error",
+    "device-side assert",
+    "an illegal memory access",
+    "CUBLAS_STATUS_",
+    "CUDNN_STATUS_",
+    "cuda runtime error",
+)
+
+
+def _is_cuda_fatal(exc: BaseException) -> bool:
+    msg = str(exc)
+    return any(marker in msg for marker in _CUDA_FATAL_MARKERS)
 
 
 @dataclass
@@ -43,6 +63,8 @@ class OcrEngine:
         self._dtype: str = settings.torch_dtype
         self._ready = False
         self._load_error: Optional[str] = None
+        self._poisoned: bool = False
+        self._poison_error: Optional[str] = None
         self._load_lock = asyncio.Lock()
         self._infer_sem = asyncio.Semaphore(settings.max_concurrent_inferences)
 
@@ -56,10 +78,14 @@ class OcrEngine:
 
     @property
     def ready(self) -> bool:
-        return self._ready
+        # A poisoned CUDA context can't recover in-process — report not ready
+        # so the healthcheck flips red and docker-compose restarts the container.
+        return self._ready and not self._poisoned
 
     @property
     def load_error(self) -> Optional[str]:
+        if self._poisoned:
+            return self._poison_error
         return self._load_error
 
     async def startup(self) -> None:
@@ -266,8 +292,13 @@ class OcrEngine:
             gen_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
 
         start = time.perf_counter()
-        with torch.inference_mode():
-            generated_ids = self._model.generate(**inputs, **gen_kwargs)
+        try:
+            with torch.inference_mode():
+                generated_ids = self._model.generate(**inputs, **gen_kwargs)
+        except RuntimeError as exc:
+            if _is_cuda_fatal(exc):
+                self._mark_poisoned(exc)
+            raise
         latency_ms = int((time.perf_counter() - start) * 1000)
 
         new_tokens = generated_ids[0][input_len:]
@@ -280,6 +311,29 @@ class OcrEngine:
             input_tokens=input_len,
             latency_ms=latency_ms,
         )
+
+    def _mark_poisoned(self, exc: BaseException) -> None:
+        """Flip the engine to unhealthy and schedule a process exit.
+
+        CUDA asserts (e.g. index-out-of-bounds) corrupt the device context;
+        every subsequent kernel re-raises the same error until the process
+        restarts. We can't recover in-place, so flip /health to red and exit
+        — docker-compose `restart: unless-stopped` brings us back clean.
+        """
+        if self._poisoned:
+            return
+        self._poisoned = True
+        self._poison_error = f"CUDA context poisoned: {type(exc).__name__}: {exc}"
+        logger.critical(
+            "CUDA fatal error detected — marking engine unhealthy and exiting in 3s. %s",
+            self._poison_error,
+        )
+
+        def _exit_soon() -> None:
+            time.sleep(3.0)  # let the current request finish returning its 5xx
+            os._exit(1)
+
+        threading.Thread(target=_exit_soon, daemon=True).start()
 
 
 engine = OcrEngine()
