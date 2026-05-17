@@ -82,6 +82,7 @@ async def infer_document(
 
     region_records, region_results = await _ocr_regions(
         regions,
+        source=page.source,
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,
         temperature=temperature,
@@ -118,6 +119,7 @@ async def infer_document(
 async def _ocr_regions(
     regions: List[Region],
     *,
+    source: str,
     max_new_tokens: int,
     do_sample: bool,
     temperature: float,
@@ -143,7 +145,12 @@ async def _ocr_regions(
                 no_repeat_ngram_size=no_repeat_ngram_size,
             )
         except Exception as exc:
-            logger.exception("Region %d (%s) OCR failed", region.index, region.label)
+            logger.exception(
+                "OCR failed on %s region %d (%s, %dx%d, bbox=%s): %s",
+                source, region.index, region.label,
+                region.crop.width, region.crop.height,
+                region.bbox_2d, exc,
+            )
             content = f"[ocr_error: {type(exc).__name__}]"
             num_tokens = input_tokens = 0
             latency_ms = 0

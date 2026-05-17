@@ -23,6 +23,11 @@ from .layout import Region
 
 logger = logging.getLogger(__name__)
 
+# Minimum pixel size on either axis for a sub-crop to be sent to the VLM.
+# Crops smaller than this in either dimension are dropped to avoid feeding
+# the vision tower nearly-empty inputs.
+_MIN_SUBCROP_PX = 80
+
 
 def _detect_dips_1d(
     profile: np.ndarray,
@@ -213,6 +218,16 @@ def _slice_region(
                 bbox_x2,
                 bbox_y1 + int(bbox_h * hi / crop_h),
             ]
+        # Reject pathologically small sub-crops on either axis — the VLM's
+        # vision tower needs a few patches in both dimensions to produce
+        # well-formed tokens, and we've seen tiny crops correlate with
+        # CUDA index-out-of-bounds during generate().
+        if min(sub_crop.width, sub_crop.height) < _MIN_SUBCROP_PX:
+            logger.debug(
+                "split: dropping sub-crop %dx%d (below min %d)",
+                sub_crop.width, sub_crop.height, _MIN_SUBCROP_PX,
+            )
+            continue
         sub_regions.append(
             Region(
                 index=region.index,
