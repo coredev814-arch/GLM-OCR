@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     trust_remote_code: bool = True
 
     max_new_tokens: int = 8192
+    # Per-region cap for layout-aware document-parse. After 2D table-split a
+    # single page may produce 20+ sub-regions; capping per-region generation
+    # bounds total page latency and keeps us under proxy ceilings (RunPod's
+    # Cloudflare front-end gives up at ~100s). 3000 is enough for any single
+    # table band but well below a hallucination loop's worst case.
+    region_max_new_tokens: int = 3000
     do_sample: bool = False
     temperature: float = 0.0
     top_p: float = 1.0

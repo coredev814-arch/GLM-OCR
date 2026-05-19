@@ -129,6 +129,9 @@ async def _ocr_regions(
     """OCR each region serially (single-GPU) and return (formatter_input, api_output)."""
     formatter_input: List[dict] = []
     api_output: List[RegionResult] = []
+    # Per-region cap — see config.region_max_new_tokens. Always respect the
+    # caller's explicit cap if it is lower.
+    region_cap = min(max_new_tokens, settings.region_max_new_tokens)
 
     for region in regions:
         prompt = _REGION_PROMPTS.get(region.task_type)
@@ -138,7 +141,7 @@ async def _ocr_regions(
             out = await engine.infer_region(
                 region.crop,
                 prompt=prompt,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=region_cap,
                 do_sample=do_sample,
                 temperature=temperature,
                 repetition_penalty=repetition_penalty,
