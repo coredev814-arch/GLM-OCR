@@ -2,7 +2,7 @@
         docker-build docker-up docker-down docker-logs smoke
 
 PY ?= python3
-PORT ?= 8889
+PORT ?= 8887
 HOST ?= 0.0.0.0
 
 help:

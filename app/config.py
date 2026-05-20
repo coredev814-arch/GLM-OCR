@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     )
 
     host: str = "0.0.0.0"
-    port: int = 8889
+    port: int = 8887
     log_level: str = "INFO"
 
     model_path: str = "zai-org/GLM-OCR"

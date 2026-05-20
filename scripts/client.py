@@ -85,7 +85,7 @@ def cmd_url(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--base-url", default="http://localhost:8889")
+    parser.add_argument("--base-url", default="http://localhost:8887")
     parser.add_argument("--timeout", type=float, default=600.0)
     sub = parser.add_subparsers(dest="command", required=True)
 

@@ -5,7 +5,7 @@ services:
     container_name: glm-ocr
     restart: unless-stopped
     ports:
-      - "${PORT:-8889}:8889"
+      - "${PORT:-8887}:8887"
     env_file:
       - .env
     volumes:
@@ -19,7 +19,7 @@ services:
               count: all
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys,json; r=urllib.request.urlopen('http://localhost:8889/health',timeout=2); sys.exit(0 if json.load(r).get('ready') else 1)"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys,json; r=urllib.request.urlopen('http://localhost:8887/health',timeout=2); sys.exit(0 if json.load(r).get('ready') else 1)"]
       interval: 30s
       timeout: 5s
       retries: 20

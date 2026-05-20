@@ -5,7 +5,7 @@
 set -u
 LOG=${LOG:-/workspace/uvicorn.log}
 HOST=${HOST:-0.0.0.0}
-PORT=${PORT:-8889}
+PORT=${PORT:-8887}
 BACKOFF=${BACKOFF:-5}
 
 cd /workspace

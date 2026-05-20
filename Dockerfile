@@ -21,6 +21,6 @@ RUN pip install --upgrade pip \
 
 COPY app ./app
 
-EXPOSE 8889
+EXPOSE 8887
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8889"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8887"]

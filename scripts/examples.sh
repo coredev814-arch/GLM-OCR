@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Curl examples against the GLM-OCR FastAPI service.
-# Assumes the server is running at http://localhost:8889.
+# Assumes the server is running at http://localhost:8887.
 set -euo pipefail
-BASE="${BASE:-http://localhost:8889}"
+BASE="${BASE:-http://localhost:8887}"
 
 echo "# Health"
 curl -sS "$BASE/health" | python3 -m json.tool
